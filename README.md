@@ -86,7 +86,8 @@ from bird_adapter import BirdSQLAdapter
 BIRD_ROOT = "/path/to/BIRD-SQL"
 adapter = BirdSQLAdapter(
     bird_root_path=BIRD_ROOT,
-    deepseek_model_path="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"  # 或使用更小的模型
+    deepseek_model_path="deepseek-ai/DeepSeek-Coder-V2-Lite-Base"  # 默认模型 (hidden_size=2048)
+    # 或使用其他模型: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B" (hidden_size=1536)
 )
 ```
 
@@ -307,11 +308,11 @@ graph_emb = attn_out.squeeze(1)
 
 ```python
 args = argparse.Namespace(
-    model_type="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",  # LLM 模型
+    model_type="deepseek-ai/DeepSeek-Coder-V2-Lite-Base",  # LLM 模型
     channels=512,  # RT 隐藏维度
     num_layers=4,  # RT 层数
     dropout=0.1,  # Dropout 率
-    text_embed_dim=1536  # 文本嵌入维度（必须与 adapter 使用的模型一致）
+    text_embed_dim=2048  # 文本嵌入维度（必须与 adapter 使用的模型一致）
 )
 ```
 
@@ -320,14 +321,15 @@ args = argparse.Namespace(
 ```python
 adapter = BirdSQLAdapter(
     bird_root_path="/path/to/BIRD-SQL",
-    deepseek_model_path="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    deepseek_model_path="deepseek-ai/DeepSeek-Coder-V2-Lite-Base"  # 默认模型
 )
 ```
 
 **注意**: `text_embed_dim` 必须与 `deepseek_model_path` 使用的模型输出维度一致：
+- **DeepSeek-Coder-V2-Lite-Base** (默认): **2048** ✅
 - DeepSeek-R1-Distill-Qwen-1.5B: **1536**
 - sentence-transformers/all-MiniLM-L6-v2: **384**
-- DeepSeek-7B/16B: **2048/4096**
+- DeepSeek-7B/16B: **2048/4096** (请检查具体模型的 config.json)
 
 ## 🐛 错误处理
 
@@ -373,7 +375,9 @@ adapter = BirdSQLAdapter(
 
 3. **模型兼容性**: 
    - 确保 `text_embed_dim` 与使用的 DeepSeek 模型维度一致
-   - 建议使用 DeepSeek-R1-Distill-Qwen-1.5B 或更小的模型以节省显存
+   - **当前默认**: DeepSeek-Coder-V2-Lite-Base (hidden_size=2048)
+   - 其他选项: DeepSeek-R1-Distill-Qwen-1.5B (hidden_size=1536) 或更小的模型以节省显存
+   - 可通过检查模型的 `config.json` 中的 `hidden_size` 确认维度
 
 4. **数据格式**: 
    - BIRD-SQL 数据集需要包含 `train/train_tables.json` 和 `train/train_databases/`

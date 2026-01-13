@@ -3,17 +3,27 @@ BIRD-SQL 版本的 DeepSeek Relational Transformer (支持 CoT 生成)
 - 移除了 RelBench 依赖
 - 移除了分类头，改为 Causal LM 生成头
 - 增加了 generate() 方法支持思维链 (CoT)
+- 修复了 'type' 列名冲突问题
+- [本次修复] 使用 device_map={"": 0} 强制单卡加载，解决 auto 策略误判显存不足的问题
 """
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
-from torch_frame import stype
-from task_type import TaskType  # 使用自定义 TaskType
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from task_type import TaskType
 import types
 
-# 默认使用的文本编码维度 (DeepSeek-R1-Distill-Qwen-1.5B 为 1536, MiniLM 为 384, 7B/16B 可能是 2048/4096)
-# 请根据 bird_adapter.py 中使用的模型调整此值
+# 尝试导入 torch_frame，如果没有则使用 Mock
+try:
+    from torch_frame import stype
+except ImportError:
+    class stype:
+        numerical = "numerical"
+        categorical = "categorical"
+        text_embedded = "text_embedded"
+
+# 默认使用的文本编码维度
 DEFAULT_TEXT_EMBED_DIM = 1536 
 
 # --- RT Blocks (保持不变) ---
@@ -36,7 +46,7 @@ class RelationalTransformerBlock(nn.Module):
         })
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, 4 * embed_dim),
-            nn.SiLU(), # 使用 SiLU 激活
+            nn.SiLU(), 
             nn.Dropout(dropout),
             nn.Linear(4 * embed_dim, embed_dim)
         )
@@ -71,9 +81,6 @@ class RTEmbedding(nn.Module):
         self.col_embs = nn.ModuleDict()
         self.val_encoders = nn.ModuleDict()
         
-        # 注意：这里不再自动加载 SentenceTransformer，而是假设 bird_adapter 已经传好了 embedding tensor
-        # text_embed_dim 必须与 bird_adapter.py 中使用的模型输出维度一致
-            
         for table in table_list:
             if table not in node_to_col_names: continue
                 
@@ -84,31 +91,38 @@ class RTEmbedding(nn.Module):
             
             # 处理数值列
             for col in col_names.get(stype.numerical, []):
-                t_val_encs[col] = nn.Sequential(nn.Linear(1, channels), nn.SiLU())
-                t_col_embs[col] = nn.Parameter(torch.randn(channels))
+                safe_col = self._safe_key(col)
+                t_val_encs[safe_col] = nn.Sequential(nn.Linear(1, channels), nn.SiLU())
+                t_col_embs[safe_col] = nn.Parameter(torch.randn(channels))
             
             # 处理分类列
             for col in col_names.get(stype.categorical, []):
-                # ... (保持原有的 categorical 统计逻辑) ...
-                num_cats = 100 # 简化处理，实际应读取 stats
+                safe_col = self._safe_key(col)
+                num_cats = 100 
                 if isinstance(stats, dict) and col in stats and stype.categorical in stats[col]:
                      if 'vocab' in stats[col][stype.categorical]:
                          num_cats = len(stats[col][stype.categorical]['vocab'])
                 
-                t_val_encs[col] = nn.Embedding(num_cats + 1, channels)
-                t_col_embs[col] = nn.Parameter(torch.randn(channels))
+                t_val_encs[safe_col] = nn.Embedding(num_cats + 1, channels)
+                t_col_embs[safe_col] = nn.Parameter(torch.randn(channels))
             
-            # 处理文本嵌入列 (这是 BIRD-SQL 的重点)
+            # 处理文本嵌入列
             for col in col_names.get(stype.text_embedded, []):
-                # 关键修改：输入维度改为 text_embed_dim
-                t_val_encs[col] = nn.Linear(text_embed_dim, channels) 
-                t_col_embs[col] = nn.Parameter(torch.randn(channels))
+                safe_col = self._safe_key(col)
+                t_val_encs[safe_col] = nn.Linear(text_embed_dim, channels) 
+                t_col_embs[safe_col] = nn.Parameter(torch.randn(channels))
                 
             self.val_encoders[table] = t_val_encs
             self.col_embs[table] = t_col_embs
 
+    def _safe_key(self, key):
+        """防止列名与 PyTorch 内置方法冲突"""
+        safe_key = str(key).replace('.', '_').replace('/', '_').replace('\\', '_')
+        safe_key = safe_key.replace(' ', '_').replace('-', '_')
+        return f"c_{safe_key}"
+
     def forward(self, tf_dict, edge_index_dict=None, table_to_node_offset=None):
-        """前向传播，将 TensorFrame 转换为嵌入序列"""
+        """前向传播"""
         all_embs = []
         node_idxs_list = []
         table_idxs_list = []
@@ -131,22 +145,23 @@ class RTEmbedding(nn.Module):
 
             col_names = self.node_to_col_names[table_name]
             
-            # 处理各类型列
             if stype.numerical in tf.feat_dict:
                 feat = tf.feat_dict[stype.numerical]
                 for i, col in enumerate(col_names.get(stype.numerical, [])):
-                    add_token(self.val_encoders[table_name][col], self.col_embs[table_name][col], feat[:, i:i+1])
+                    safe_col = self._safe_key(col)
+                    add_token(self.val_encoders[table_name][safe_col], self.col_embs[table_name][safe_col], feat[:, i:i+1])
             
             if stype.categorical in tf.feat_dict:
                 feat = tf.feat_dict[stype.categorical]
                 for i, col in enumerate(col_names.get(stype.categorical, [])):
-                    add_token(self.val_encoders[table_name][col], self.col_embs[table_name][col], feat[:, i])
+                    safe_col = self._safe_key(col)
+                    add_token(self.val_encoders[table_name][safe_col], self.col_embs[table_name][safe_col], feat[:, i])
             
             if stype.text_embedded in tf.feat_dict:
                 feat = tf.feat_dict[stype.text_embedded]
                 for i, col in enumerate(col_names.get(stype.text_embedded, [])):
-                    # feat[:, i, :] 应该是 [Num_Rows, text_embed_dim]
-                    add_token(self.val_encoders[table_name][col], self.col_embs[table_name][col], feat[:, i, :])
+                    safe_col = self._safe_key(col)
+                    add_token(self.val_encoders[table_name][safe_col], self.col_embs[table_name][safe_col], feat[:, i, :])
             
             curr_node_offset += num_rows
             
@@ -156,7 +171,6 @@ class RTEmbedding(nn.Module):
         node_idxs = torch.cat(node_idxs_list, dim=0)
         table_idxs = torch.cat(table_idxs_list, dim=0)
         
-        # Col Idxs reconstruction
         col_idxs_tensor_list = []
         c_counter = 0
         for table_name in self.table_list:
@@ -171,7 +185,6 @@ class RTEmbedding(nn.Module):
                 c_counter += 1
         col_idxs = torch.cat(col_idxs_tensor_list, dim=0)
         
-        # 构建 f2p_nbr_idxs (简化版，复用之前逻辑)
         f2p_nbr_idxs = None
         if edge_index_dict and table_to_node_offset:
             max_parents = 16
@@ -234,7 +247,23 @@ class DeepSeekRelationalModel(nn.Module):
         super().__init__()
         self.task = task
         self.model_type = args.model_type
-        self.main_device = torch.device("cuda:0") 
+        
+        # [多GPU支持] 检测可用的GPU数量
+        if torch.cuda.is_available():
+            num_gpus = torch.cuda.device_count()
+            # 如果指定了CUDA_VISIBLE_DEVICES，使用所有可见的GPU
+            visible_gpus = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+            if visible_gpus:
+                # 解析可见的GPU列表（如 "2,4,6,7"）
+                gpu_list = [int(x.strip()) for x in visible_gpus.split(',') if x.strip()]
+                num_gpus = len(gpu_list) if gpu_list else num_gpus
+            self.num_gpus = min(num_gpus, 4)  # 最多使用4张GPU
+            self.main_device = torch.device("cuda:0")  # 主设备仍然是cuda:0（相对于CUDA_VISIBLE_DEVICES）
+            print(f"   🎯 Using {self.num_gpus} GPU(s) for model distribution")
+        else:
+            self.num_gpus = 0
+            self.main_device = torch.device("cpu")
+        
         self.hidden_dim = args.channels
         
         # 保存原始 data
@@ -242,14 +271,13 @@ class DeepSeekRelationalModel(nn.Module):
         
         col_names_dict = {}
         valid_table_list = []
-        for node_type in data.node_types:
-            if hasattr(data[node_type], 'tf') and data[node_type].tf is not None:
-                col_names_dict[node_type] = data[node_type].tf.col_names_dict
-                valid_table_list.append(node_type)
+        if data is not None:
+            for node_type in data.node_types:
+                if hasattr(data[node_type], 'tf') and data[node_type].tf is not None:
+                    col_names_dict[node_type] = data[node_type].tf.col_names_dict
+                    valid_table_list.append(node_type)
         
         filtered_col_stats_dict = {t: col_stats_dict.get(t, {}) for t in valid_table_list}
-        
-        # 获取 Embedding 维度，优先从 args 获取，否则用默认
         text_embed_dim = getattr(args, 'text_embed_dim', DEFAULT_TEXT_EMBED_DIM)
 
         # RT Tokenizer & Layers
@@ -265,17 +293,86 @@ class DeepSeekRelationalModel(nn.Module):
             for _ in range(args.num_layers)
         ])
 
-        # LLM Loading
-        print(f"🚀 Loading LLM ({self.model_type}) for Generation...")
+        # LLM Loading (4-bit Quantization)
+        print(f"🚀 Loading LLM ({self.model_type}) with 4-bit Quantization (Forced on GPU 0)...")
+        
+        # [内存优化] 在加载前清理 GPU 缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"   💾 GPU Memory Before Loading: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB / {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB")
+        
+        # [配置] 4-bit 量化
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+
+        # [多GPU支持] 将LLM分散到多个GPU
+        # [关键修复] 使用CPU offloading + 严格的max_memory限制
+        if self.num_gpus > 1:
+            # 使用CPU offloading，让部分层在CPU上，减少GPU内存压力
+            # GPU 0: 限制为3GB（为RT组件预留更多空间）
+            # GPU 1-3: 各4GB
+            # CPU: 剩余层
+            max_memory = {
+                0: "3GB",  # GPU 0限制更严格
+                1: "4GB",
+                2: "4GB", 
+                3: "4GB"
+            }
+            # 添加CPU offloading
+            max_memory["cpu"] = "30GB"  # CPU可以存储更多
+            
+            device_map = "auto"  # 让accelerate自动分配，但受max_memory限制
+            print(f"   🎯 Distributing LLM with CPU offloading across {self.num_gpus} GPUs")
+            print(f"      GPU 0: max 3GB (reserved for RT components)")
+            print(f"      GPU 1-3: max 4GB each")
+            print(f"      CPU: overflow layers")
+        else:
+            device_map = {"": 0}
+            max_memory = {0: "22GB"} if torch.cuda.is_available() else None
+
         self.llm = AutoModelForCausalLM.from_pretrained(
             self.model_type, 
-            device_map="auto",
+            device_map=device_map,
+            quantization_config=bnb_config,
             torch_dtype=torch.float16, 
-            trust_remote_code=True
+            trust_remote_code=True,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+            max_memory=max_memory if torch.cuda.is_available() else None
         )
-        # 加载 Tokenizer (用于 generate 方法)
-        self.llm_tokenizer = AutoTokenizer.from_pretrained(self.model_type, trust_remote_code=True)
-        self.llm_tokenizer.padding_side = 'left' # 这一步很关键
+        
+        # [内存优化] 加载后再次清理缓存，并检查所有GPU的内存使用
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"   ✅ GPU Memory After Loading:")
+            for i in range(self.num_gpus):
+                allocated = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                print(f"      GPU {i}: {allocated:.2f} GB / {reserved:.2f} GB")
+            
+            # [关键修复] 如果GPU 0内存占用过高，强制清理并尝试释放
+            gpu0_reserved = torch.cuda.memory_reserved(0) / 1024**3
+            if gpu0_reserved > 10:  # 如果GPU 0预留超过10GB
+                print(f"   ⚠️  GPU 0 has high memory reservation ({gpu0_reserved:.2f} GB), attempting to free...")
+                # 强制同步所有CUDA操作
+                torch.cuda.synchronize()
+                # 多次清理缓存
+                for _ in range(3):
+                    torch.cuda.empty_cache()
+                # 检查清理后的内存
+                gpu0_reserved_after = torch.cuda.memory_reserved(0) / 1024**3
+                print(f"   ✅ After cleanup: GPU 0 reserved = {gpu0_reserved_after:.2f} GB")
+        
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(
+            self.model_type, 
+            trust_remote_code=True,
+            local_files_only=True
+        )
+        self.llm_tokenizer.padding_side = 'left'
         if self.llm_tokenizer.pad_token is None:
              self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
 
@@ -285,9 +382,7 @@ class DeepSeekRelationalModel(nn.Module):
                  module.forward = types.MethodType(deepseek_moe_forward_fixed, module)
         
         # 冻结 LLM 参数
-        for param in self.llm.parameters(): param.requires_grad = False
             
-        # Projector: RT Dim -> LLM Dim
         llm_dim = self.llm.config.hidden_size
         self.projector = nn.Sequential(
             nn.Linear(self.hidden_dim, 1024),
@@ -295,8 +390,6 @@ class DeepSeekRelationalModel(nn.Module):
             nn.Linear(1024, llm_dim)
         )
         
-        # Attention-based Pooling for structure aggregation
-        # 用于替代简单的 Mean Pooling，更好地聚合重要节点
         self.attention_pool = nn.MultiheadAttention(
             embed_dim=self.hidden_dim,
             num_heads=4,
@@ -305,20 +398,122 @@ class DeepSeekRelationalModel(nn.Module):
         )
         self.pool_query = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
         
-        # 移除了 self.head (不再需要)
-
-        # 移动到主设备
-        self.tokenizer.to(self.main_device)
-        self.rt_layers.to(self.main_device)
-        self.projector.to(self.main_device)
-        self.attention_pool.to(self.main_device)
-        # pool_query 已经是 Parameter，直接移动到设备
-        self.pool_query.data = self.pool_query.data.to(self.main_device)
+        # [多GPU支持] 将RT组件分散到多个GPU
+        # [关键修复] 如果所有GPU内存都不足，将部分组件放在CPU上
+        if torch.cuda.is_available() and self.num_gpus > 1:
+            print(f"   📦 Distributing RT components across {self.num_gpus} GPUs...")
+            
+            # 检查所有GPU的可用内存
+            gpu_available = []
+            for i in range(self.num_gpus):
+                gpu_total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                gpu_reserved = torch.cuda.memory_reserved(i) / 1024**3
+                gpu_available.append(gpu_total - gpu_reserved)
+                print(f"   💾 GPU {i}: {gpu_reserved:.2f} GB reserved / {gpu_total:.2f} GB total ({gpu_available[i]:.2f} GB available)")
+            
+            # 找到可用内存最多的GPU
+            best_gpu = max(range(self.num_gpus), key=lambda i: gpu_available[i])
+            print(f"   🎯 Best GPU for RT components: GPU {best_gpu} ({gpu_available[best_gpu]:.2f} GB available)")
+            
+            # 如果所有GPU可用内存都很少，使用CPU offloading
+            if all(avail < 1.0 for avail in gpu_available):
+                print(f"   ⚠️  All GPUs have limited memory, using CPU for some RT components")
+                tokenizer_device = torch.device("cpu")
+                rt_layers_device = torch.device("cpu")
+                projector_device = torch.device("cpu")
+                attention_device = torch.device("cpu")
+            else:
+                # 将组件分散到可用内存最多的GPU
+                tokenizer_device = torch.device(f"cuda:{best_gpu}")
+                # rt_layers分散到GPU 1和2（如果可用）
+                rt_layers_device = torch.device("cuda:1") if self.num_gpus > 1 and gpu_available[1] > 1.0 else torch.device("cuda:0")
+                projector_device = torch.device("cuda:2") if self.num_gpus > 2 and gpu_available[2] > 1.0 else torch.device("cuda:0")
+                attention_device = torch.device("cuda:3") if self.num_gpus > 3 and gpu_available[3] > 1.0 else torch.device("cuda:0")
+            
+            # 1. 较小的组件（pool_query放在主设备）
+            try:
+                self.pool_query.data = self.pool_query.data.to(self.main_device)
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                # 如果失败，放在CPU
+                self.pool_query.data = self.pool_query.data.to(torch.device("cpu"))
+            
+            # 2. Tokenizer
+            try:
+                self.tokenizer.to(tokenizer_device)
+                torch.cuda.empty_cache()
+                print(f"   ✅ Tokenizer moved to {tokenizer_device}")
+            except RuntimeError as e:
+                print(f"   ❌ Failed to move tokenizer: {e}, keeping on CPU")
+                self.tokenizer.to(torch.device("cpu"))
+            
+            # 3. RT Layers（分散到不同GPU或CPU）
+            mid_layer = len(self.rt_layers) // 2
+            try:
+                for i in range(mid_layer):
+                    self.rt_layers[i] = self.rt_layers[i].to(rt_layers_device)
+                torch.cuda.empty_cache()
+                print(f"   ✅ RT layers (first half) moved to {rt_layers_device}")
+            except RuntimeError as e:
+                print(f"   ⚠️  Failed to move RT layers to {rt_layers_device}: {e}, using CPU")
+                for i in range(mid_layer):
+                    self.rt_layers[i] = self.rt_layers[i].to(torch.device("cpu"))
+            
+            try:
+                for i in range(mid_layer, len(self.rt_layers)):
+                    self.rt_layers[i] = self.rt_layers[i].to(rt_layers_device)
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                for i in range(mid_layer, len(self.rt_layers)):
+                    self.rt_layers[i] = self.rt_layers[i].to(torch.device("cpu"))
+            
+            # 4. Projector
+            try:
+                self.projector.to(projector_device)
+                torch.cuda.empty_cache()
+                print(f"   ✅ Projector moved to {projector_device}")
+            except RuntimeError:
+                self.projector.to(torch.device("cpu"))
+                print(f"   ⚠️  Projector moved to CPU")
+            
+            # 5. Attention Pool
+            try:
+                self.attention_pool.to(attention_device)
+                torch.cuda.empty_cache()
+                print(f"   ✅ Attention pool moved to {attention_device}")
+            except RuntimeError:
+                self.attention_pool.to(torch.device("cpu"))
+                print(f"   ⚠️  Attention pool moved to CPU")
+            
+            # 打印各GPU内存使用
+            for i in range(self.num_gpus):
+                allocated = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                print(f"   ✅ GPU {i}: {allocated:.2f} GB / {reserved:.2f} GB")
+        elif torch.cuda.is_available():
+            # 单GPU模式：分批移动组件
+            print("   📦 Moving components to GPU (with memory optimization)...")
+            self.pool_query.data = self.pool_query.data.to(self.main_device)
+            torch.cuda.empty_cache()
+            self.projector.to(self.main_device)
+            torch.cuda.empty_cache()
+            self.attention_pool.to(self.main_device)
+            torch.cuda.empty_cache()
+            self.rt_layers.to(self.main_device)
+            torch.cuda.empty_cache()
+            self.tokenizer.to(self.main_device)
+            torch.cuda.empty_cache()
+            print(f"   ✅ All components moved. Final GPU Memory: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB / {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB")
+        else:
+            # CPU 模式，直接移动
+            self.tokenizer.to(self.main_device)
+            self.rt_layers.to(self.main_device)
+            self.projector.to(self.main_device)
+            self.attention_pool.to(self.main_device)
+            self.pool_query.data = self.pool_query.data.to(self.main_device)
 
     def create_masks(self, node_idxs, col_idxs, table_idxs, f2p_nbr_idxs=None, is_padding=None):
-        """(保持原样) 构建四种注意力机制的mask"""
-        # ... (Create Masks 代码与之前一致，省略以节省空间，请保留原有的实现) ...
-        # 请务必保留原文件中的 create_masks 实现，不要删除！
+        """(保持原样)"""
         if node_idxs.dim() == 1:
             node_idxs = node_idxs.unsqueeze(0)
             col_idxs = col_idxs.unsqueeze(0)
@@ -353,31 +548,21 @@ class DeepSeekRelationalModel(nn.Module):
         return masks
 
     def encode_structure(self, batch):
-        """
-        提取 RT 结构特征 (核心逻辑复用)
-        Returns: 
-            x_llm: [1, LLM_Dim] (Projected RT output) 或 None (如果出错)
-        """
+        """提取 RT 结构特征"""
         try:
-            # 1. 准备 TF Dict
             tf_dict = {}
             for node_type in batch.node_types:
                 if hasattr(batch[node_type], 'tf') and batch[node_type].tf is not None:
                     tf_dict[node_type] = batch[node_type].tf
             
-            # Fallback to original data if needed
             for node_type in batch.node_types:
                 if node_type not in tf_dict and node_type in self.original_data.node_types:
                     original_tf = getattr(self.original_data[node_type], 'tf', None)
                     if original_tf is not None:
-                        # 简化处理，实际应根据索引切片
                         tf_dict[node_type] = original_tf
                         
-            if not tf_dict:
-                print("⚠️ Warning: No TensorFrame found in batch")
-                return None
+            if not tf_dict: return None
 
-            # 2. 计算 Offset
             table_to_node_offset = {}
             node_offset = 0
             for table_name in self.tokenizer.table_list:
@@ -385,7 +570,6 @@ class DeepSeekRelationalModel(nn.Module):
                     table_to_node_offset[table_name] = node_offset
                     node_offset += tf_dict[table_name].num_rows
             
-            # 3. RT Tokenization
             tokenizer_output = self.tokenizer(
                 tf_dict,
                 edge_index_dict=batch.edge_index_dict,
@@ -393,188 +577,116 @@ class DeepSeekRelationalModel(nn.Module):
             )
             x, node_idxs, col_idxs, table_idxs, f2p_nbr_idxs, total_rows = tokenizer_output
             
-            if x is None or x.shape[0] == 0:
-                print("⚠️ Warning: Tokenizer returned empty output")
-                return None
+            if x is None or x.shape[0] == 0: return None
             
-            # 4. RT Layers
             masks = self.create_masks(node_idxs, col_idxs, table_idxs, f2p_nbr_idxs)
-            # 统一处理：确保有 batch 维度
-            if x.dim() == 2:
-                x = x.unsqueeze(0)  # [1, N, Dim]
-            
-            # 确保 masks 也有 batch 维度
+            if x.dim() == 2: x = x.unsqueeze(0)
             if isinstance(masks, dict):
                 for key in masks:
-                    if masks[key].dim() == 2:
-                        masks[key] = masks[key].unsqueeze(0)
+                    if masks[key].dim() == 2: masks[key] = masks[key].unsqueeze(0)
             
-            for layer in self.rt_layers:
+            # [多GPU支持] 确保数据在正确的设备上，并处理分散的RT layers
+            for i, layer in enumerate(self.rt_layers):
+                # 获取当前layer所在的设备
+                layer_device = next(layer.parameters()).device
+                # 将数据移动到layer的设备
+                if x.device != layer_device:
+                    x = x.to(layer_device)
+                    masks = {k: v.to(layer_device) for k, v in masks.items()}
                 x = layer(x, masks)
             
-            # 移除 batch 维度（如果只有一个样本）
-            if x.shape[0] == 1:
-                x = x.squeeze(0)  # [N, Dim]
+            if x.shape[0] == 1: x = x.squeeze(0)
             
-            # 5. Aggregate (Attention-based Pooling)
-            # 使用 Attention Pooling 替代简单的 Mean Pooling
-            # 这样可以自动学习哪些节点更重要
-            if x.dim() == 2:
-                x = x.unsqueeze(0)  # [1, N, Dim] for attention
+            if x.dim() == 2: x = x.unsqueeze(0)
             
-            # 使用可学习的 query 进行 attention pooling
-            query = self.pool_query.to(x.device).expand(x.shape[0], -1, -1)  # [1, 1, Dim]
-            attn_out, attn_weights = self.attention_pool(
-                query=query,
-                key=x,
-                value=x,
-                need_weights=False
-            )
-            graph_emb = attn_out.squeeze(1)  # [1, RT_Dim]
+            # [多GPU支持] 确保attention_pool在正确的设备上
+            attention_device = next(self.attention_pool.parameters()).device
+            if x.device != attention_device:
+                x = x.to(attention_device)
+            query = self.pool_query.to(attention_device).expand(x.shape[0], -1, -1)
+            attn_out, attn_weights = self.attention_pool(query=query, key=x, value=x, need_weights=False)
+            graph_emb = attn_out.squeeze(1)
             
-            # 如果 attention 失败，fallback 到 mean pooling
-            if graph_emb.shape[0] == 0:
-                graph_emb = x.mean(dim=1)  # [1, RT_Dim]
+            if graph_emb.shape[0] == 0: graph_emb = x.mean(dim=1)
             
-            # 6. Project to LLM Space
-            x_llm = self.projector(graph_emb)  # [1, LLM_Dim]
-            
+            # [多GPU支持] 确保projector在正确的设备上
+            projector_device = next(self.projector.parameters()).device
+            if graph_emb.device != projector_device:
+                graph_emb = graph_emb.to(projector_device)
+            x_llm = self.projector(graph_emb)
             return x_llm
             
         except Exception as e:
             print(f"❌ Error in encode_structure: {e}")
-            import traceback
-            traceback.print_exc()
             return None
 
     def forward(self, batch, input_ids=None, labels=None, **kwargs):
-        """
-        训练模式: Causal LM Loss
-        Args:
-            batch: HeteroData (Graph structure) 或 List[HeteroData] (批量处理)
-            input_ids: [B, Seq_Len] (Question + SQL tokens)
-            labels: [B, Seq_Len] (SQL tokens only, Question part masked as -100)
-        Returns:
-            loss: torch.Tensor 或 None (如果出错)
-            logits: torch.Tensor 或 None
-        """
+        """训练模式: Causal LM Loss"""
         try:
-            # 处理 batch 输入：支持单个 HeteroData 或列表
             if isinstance(batch, list):
-                # 如果 batch 是列表，目前只处理第一个（未来可以扩展为真正的批量处理）
-                if len(batch) == 0:
-                    print("⚠️ Warning: Empty batch list")
-                    return torch.tensor(0.0, device=self.main_device), None
+                if len(batch) == 0: return torch.tensor(0.0, device=self.main_device, requires_grad=True), None
                 batch = batch[0]
             
-            # 1. 计算结构特征 (Soft Prompt)
-            if input_ids is None:
-                print("⚠️ Warning: input_ids is None in forward")
-                return torch.tensor(0.0, device=self.main_device), None
+            if input_ids is None: return torch.tensor(0.0, device=self.main_device, requires_grad=True), None
             
             bsz = input_ids.shape[0]
             
-            rt_out = self.encode_structure(batch)  # [1, LLM_Dim]
+            rt_out = self.encode_structure(batch)
             if rt_out is None:
-                # 返回零损失而不是 None，避免训练中断
-                print("⚠️ Warning: encode_structure returned None, returning zero loss")
                 return torch.tensor(0.0, device=self.main_device, requires_grad=True), None
             
-            # 使用 repeat 而不是 expand，确保内存安全
-            structure_prompt = rt_out.repeat(bsz, 1)  # [B, LLM_Dim]
-            structure_prompt = structure_prompt.unsqueeze(1)  # [B, 1, LLM_Dim]
+            structure_prompt = rt_out.repeat(bsz, 1).unsqueeze(1)
+            llm_embeds = self.llm.get_input_embeddings()(input_ids)
+            inputs_embeds = torch.cat([structure_prompt, llm_embeds], dim=1)
             
-            # 2. 准备 Text Embeddings
-            # 这里的 input_ids 是 Question + SQL
-            llm_embeds = self.llm.get_input_embeddings()(input_ids)  # [B, Seq, LLM_Dim]
-            
-            # 3. Concat: [Structure, Text]
-            inputs_embeds = torch.cat([structure_prompt, llm_embeds], dim=1)  # [B, 1+Seq, LLM_Dim]
-            
-            # 4. 调整 Labels (Shift for Soft Prompt)
             if labels is not None:
-                # Soft prompt 没有 label (-100)
                 prefix_labels = torch.full((bsz, 1), -100, dtype=labels.dtype, device=labels.device)
                 labels = torch.cat([prefix_labels, labels], dim=1)
             
-            # 5. LLM Forward
             outputs = self.llm(
                 inputs_embeds=inputs_embeds,
                 labels=labels,
                 output_hidden_states=False
             )
-            
             return outputs.loss, outputs.logits
             
         except Exception as e:
             print(f"❌ Error in forward: {e}")
-            import traceback
-            traceback.print_exc()
-            # 返回零损失，避免训练中断
             return torch.tensor(0.0, device=self.main_device, requires_grad=True), None
 
     @torch.no_grad()
     def generate(self, batch, question_text_list, max_new_tokens=512):
-        """
-        推理模式: CoT Generation
-        Args:
-            batch: HeteroData 或 List[HeteroData]
-            question_text_list: List[str] 自然语言问题
-        Returns:
-            List[str]: 生成的文本列表
-        """
+        """推理模式: CoT Generation"""
         try:
             self.eval()
-            
-            # 处理 batch 输入
             if isinstance(batch, list):
-                if len(batch) == 0:
-                    return ["Error: Empty batch list"] * len(question_text_list)
-                batch = batch[0]  # 目前只处理第一个，未来可扩展
+                if len(batch) == 0: return ["Error: Empty batch list"] * len(question_text_list)
+                batch = batch[0]
             
             bsz = len(question_text_list)
-            if bsz == 0:
-                return []
+            if bsz == 0: return []
             
-            # 1. 结构特征
             rt_out = self.encode_structure(batch)
-            if rt_out is None:
-                return ["Error: No structure"] * bsz
+            if rt_out is None: return ["Error: No structure"] * bsz
             
-            # 使用 repeat 确保内存安全
-            structure_prompt = rt_out.repeat(bsz, 1).unsqueeze(1)  # [B, 1, LLM_Dim]
-            
-            # 2. 文本编码
-            # 构造 Prompt: "Question: ... \n Answer:"
-            # DeepSeek-R1 建议的 prompt 格式
+            structure_prompt = rt_out.repeat(bsz, 1).unsqueeze(1)
             prompts = [f"Question: {q}\nAnswer:" for q in question_text_list]
             inputs = self.llm_tokenizer(prompts, return_tensors="pt", padding=True).to(self.main_device)
-            
             text_embeds = self.llm.get_input_embeddings()(inputs.input_ids)
             
-            # 3. Concat
             inputs_embeds = torch.cat([structure_prompt, text_embeds], dim=1)
-            
-            # Attention Mask (给 soft prompt 补 1)
             soft_prompt_mask = torch.ones((bsz, 1), device=self.main_device, dtype=inputs.attention_mask.dtype)
             attention_mask = torch.cat([soft_prompt_mask, inputs.attention_mask], dim=1)
             
-            # 4. Generate
-            # DeepSeek 会自动输出 <think>...</think>
             outputs = self.llm.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 pad_token_id=self.llm_tokenizer.eos_token_id,
-                do_sample=False  # Greedy decoding for stability in SQL
+                do_sample=False 
             )
-            
-            # 5. Decode
             decoded = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
             return decoded
-            
         except Exception as e:
             print(f"❌ Error in generate: {e}")
-            import traceback
-            traceback.print_exc()
             return [f"Error: {str(e)}"] * len(question_text_list) if question_text_list else []

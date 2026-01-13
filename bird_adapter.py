@@ -97,68 +97,113 @@ class DatabaseConnectionPool:
 
 # --- 核心适配器类 ---
 class BirdSQLAdapter:
-    def __init__(self, bird_root_path: str, deepseek_model_path: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"):
+    def __init__(self, bird_root_path: str, deepseek_model_path: str = "deepseek-ai/DeepSeek-Coder-V2-Lite-Base"):
         """
         Args:
             bird_root_path: BIRD数据集根目录 (包含 train/train_tables.json 等)
-            deepseek_model_path: 用于语义对齐的 DeepSeek 模型路径 (可用较小的版本以节省显存)
+            deepseek_model_path: 用于语义对齐的 DeepSeek 模型路径
         """
         self.root = bird_root_path
         self.train_tables_path = os.path.join(self.root, "train", "train_tables.json")
         self.train_db_root = os.path.join(self.root, "train", "train_databases")
         self.train_json_path = os.path.join(self.root, "train", "train.json")
         
+        # 定义缓存目录
+        self.cache_dir = os.path.join(self.root, "cache_deepseek_rt")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
         print(f"🚀 Initializing BIRD-SQL Adapter...")
         print(f"   - Root: {self.root}")
+        print(f"   - Cache Dir: {self.cache_dir}")
         print(f"   - Embedding Model: {deepseek_model_path}")
 
-        # 1. 加载 DeepSeek 语义编码器 (用于 Schema Pruning 和 Feature Initialization)
-        self.tokenizer = AutoTokenizer.from_pretrained(deepseek_model_path, trust_remote_code=True)
-        self.model = AutoModel.from_pretrained(deepseek_model_path, trust_remote_code=True, device_map="auto")
+        # 1. 加载 DeepSeek 语义编码器
+        # [内存优化] 使用 CPU offloading，减少 GPU 内存占用
+        # 模型会加载到 CPU，只在需要时临时移动到 GPU
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                deepseek_model_path, 
+                trust_remote_code=True,
+                local_files_only=True
+            )
+            # [关键] 使用 CPU offloading，避免占用 GPU 内存
+            self.model = AutoModel.from_pretrained(
+                deepseek_model_path, 
+                trust_remote_code=True, 
+                device_map="cpu",  # 先加载到 CPU
+                local_files_only=True,
+                torch_dtype=torch.float16  # 使用 float16 减少内存
+            )
+            print("   ✅ Adapter model loaded to CPU (will move to GPU only when needed)")
+        except Exception as e:
+            print(f"⚠️ Warning: Failed to load local model: {e}")
+            print("   Trying to load with network access...")
+            self.tokenizer = AutoTokenizer.from_pretrained(deepseek_model_path, trust_remote_code=True)
+            self.model = AutoModel.from_pretrained(
+                deepseek_model_path, 
+                trust_remote_code=True, 
+                device_map="cpu",  # CPU offloading
+                torch_dtype=torch.float16
+            )
+            
         self.model.eval()
         
         # 2. 解析 Schema Graph
         self.schemas, self.graphs = self._load_and_build_graphs()
         
-        # 3. 预计算 Schema Embeddings (Table & Column Names)
-        #    这对于 Pruning 时的相似度计算至关重要
+        # 3. 预计算 Schema Embeddings (带磁盘缓存)
         self.schema_embeddings = self._precompute_schema_embeddings()
         
         # 4. 初始化数据库连接池
         self.db_pool = DatabaseConnectionPool(max_connections=10)
         
-        # 5. 问题编码缓存 (使用哈希避免重复编码)
+        # 5. 问题编码缓存
         self._question_cache = {}
         self._cache_lock = Lock()
 
     def _encode_text(self, texts: List[str], device="cuda", use_cache=True) -> torch.Tensor:
-        """使用 DeepSeek 获取文本嵌入 (Last Hidden State Mean Pooling)
-        
-        Args:
-            texts: 文本列表
-            device: 设备
-            use_cache: 是否使用缓存（仅对单个文本有效）
-        """
-        # 如果只有一个文本且启用缓存，尝试从缓存获取
+        """使用 DeepSeek 获取文本嵌入"""
         if len(texts) == 1 and use_cache:
             text = texts[0]
             text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
-            
             with self._cache_lock:
                 if text_hash in self._question_cache:
                     return self._question_cache[text_hash]
         
-        # 批量编码
+        # [修复] 安全获取模型设备
+        if self.model is None:
+            raise RuntimeError("Model is not loaded. Cannot encode text.")
+        
+        # [内存优化] 如果模型在 CPU 上，临时移动到 GPU 进行编码
+        model_was_on_cpu = False
+        target_device = torch.device(device) if isinstance(device, str) else device
+        
+        try:
+            first_param = next(self.model.parameters(), None)
+            if first_param is not None:
+                current_device = first_param.device
+                # 如果模型在 CPU 上，且目标设备是 GPU，临时移动
+                if current_device.type == 'cpu' and target_device.type == 'cuda':
+                    model_was_on_cpu = True
+                    # 临时移动到 GPU（只移动必要的层）
+                    self.model = self.model.to(target_device)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()  # 清理缓存
+        except Exception as e:
+            print(f"   ⚠️  Warning: Could not check/move model device: {e}")
+        
         batch_size = 32
         all_embs = []
         
         with torch.no_grad():
             for i in range(0, len(texts), batch_size):
                 batch = texts[i:i+batch_size]
-                inputs = self.tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=128).to(self.model.device)
-                outputs = self.model(**inputs, output_hidden_states=True)
-                # 使用最后一层的 Mean Pooling
-                last_hidden = outputs.last_hidden_state # [B, Seq, Dim]
+                inputs = self.tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=128)
+                # 将输入移动到目标设备
+                inputs = {k: v.to(target_device) for k, v in inputs.items()}
+                
+                outputs = self.model(**inputs, output_hidden_states=True, use_cache=False)
+                last_hidden = outputs.last_hidden_state
                 mask = inputs.attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
                 sum_embeddings = torch.sum(last_hidden * mask, 1)
                 sum_mask = torch.clamp(mask.sum(1), min=1e-9)
@@ -167,13 +212,19 @@ class BirdSQLAdapter:
         
         result = torch.cat(all_embs, dim=0)
         
-        # 缓存单个文本的结果
+        # [内存优化] 如果模型是从 CPU 临时移动到 GPU 的，编码完成后移回 CPU
+        if model_was_on_cpu:
+            try:
+                self.model = self.model.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()  # 清理 GPU 缓存
+            except Exception as e:
+                print(f"   ⚠️  Warning: Could not move model back to CPU: {e}")
+        
         if len(texts) == 1 and use_cache:
             text_hash = hashlib.md5(texts[0].encode('utf-8')).hexdigest()
             with self._cache_lock:
-                # 限制缓存大小（LRU 策略：保留最近 1000 个）
                 if len(self._question_cache) >= 1000:
-                    # 删除最旧的（简单策略：删除第一个）
                     oldest_key = next(iter(self._question_cache))
                     del self._question_cache[oldest_key]
                 self._question_cache[text_hash] = result
@@ -181,7 +232,7 @@ class BirdSQLAdapter:
         return result
 
     def _load_and_build_graphs(self):
-        """解析 JSON 构建 NetworkX 图 (用于 2-hop 扩展)"""
+        """解析 JSON 构建 NetworkX 图"""
         print("📊 Parsing Schema and Building Graphs...")
         with open(self.train_tables_path, 'r', encoding='utf-8') as f:
             tables_data = json.load(f)
@@ -192,44 +243,38 @@ class BirdSQLAdapter:
         for db in tables_data:
             db_id = db['db_id']
             schemas[db_id] = db
-            
-            # 构建无向图用于 BFS
             G = nx.Graph() 
-            
-            # 添加节点 (Table)
             for i, tbl_name in enumerate(db['table_names']):
                 G.add_node(i, name=tbl_name, type='table')
-                
-            # 添加边 (Foreign Keys)
-            # foreign_keys: [[col_idx_src, col_idx_dst], ...]
-            column_names = db['column_names'] # [table_idx, col_name]
+            
+            column_names = db['column_names']
             for src_col_idx, dst_col_idx in db['foreign_keys']:
                 src_tbl_idx = column_names[src_col_idx][0]
                 dst_tbl_idx = column_names[dst_col_idx][0]
-                
-                # 忽略自环或同一个表的关联 (虽然 BIRD 里不多)
                 if src_tbl_idx != dst_tbl_idx:
                     G.add_edge(src_tbl_idx, dst_tbl_idx, type='fk')
-            
             graphs[db_id] = G
             
         return schemas, graphs
 
     def _precompute_schema_embeddings(self):
-        """预计算所有表名和列名的 Embedding"""
-        print("🧠 Precomputing Schema Embeddings...")
+        """预计算所有表名和列名的 Embedding (带磁盘缓存)"""
+        cache_file = os.path.join(self.cache_dir, "schema_embeddings.pt")
+        
+        if os.path.exists(cache_file):
+            print(f"💾 Loading cached schema embeddings from {cache_file}...")
+            return torch.load(cache_file)
+            
+        print("🧠 Precomputing Schema Embeddings (First Time Run)...")
         cache = {}
         
         for db_id, schema in tqdm(self.schemas.items()):
-            # 1. 编码表名
             table_texts = [f"Table: {name}" for name in schema['table_names']]
-            # 2. 编码列名 (Column: name Type: type)
             col_texts = []
             for idx, (tbl_idx, col_name) in enumerate(schema['column_names']):
                 col_type = schema['column_types'][idx]
                 col_texts.append(f"Column: {col_name} Type: {col_type}")
                 
-            # 批量编码
             t_embs = self._encode_text(table_texts)
             c_embs = self._encode_text(col_texts)
             
@@ -237,16 +282,50 @@ class BirdSQLAdapter:
                 'table_embs': t_embs,
                 'col_embs': c_embs
             }
+        
+        print(f"💾 Saving schema embeddings to {cache_file}...")
+        torch.save(cache, cache_file)
         return cache
 
-    def prune_schema(self, question: str, db_id: str, top_k_tables=4) -> Tuple[List[int], List[int]]:
+    def get_all_schema_metadata(self):
         """
-        核心函数：Question-Aware Schema Pruning (2-hop)
+        [新增] 获取所有数据库的 Schema 元数据
+        用于模型初始化时构建参数 (RTEmbedding)，解决 'NoneType' 报错
+        """
+        meta_data = HeteroData()
+        print("📦 Constructing Global Schema Metadata for Initialization...")
         
-        Returns:
-            active_table_indices: 选中的表索引列表
-            active_col_indices: 选中的列索引列表
-        """
+        # 使用 set 避免重复处理同名表
+        processed_tables = set()
+        
+        for db_id, schema in self.schemas.items():
+            table_names = schema['table_names']
+            column_names = schema['column_names'] # [table_idx, col_name]
+            
+            for t_idx, t_name in enumerate(table_names):
+                if t_name in processed_tables:
+                    continue
+                processed_tables.add(t_name)
+                
+                # 收集该表的所有列名
+                curr_cols = []
+                for c_idx, (tbl_idx, c_name) in enumerate(column_names):
+                    if tbl_idx == t_idx:
+                        curr_cols.append(c_name)
+                
+                # 构造 MockTensorFrame 元数据
+                col_names_dict = {
+                    stype.text_embedded: curr_cols
+                }
+                feat_dict = {} # 空字典，因为初始化不需要真实数据
+                
+                meta_data[t_name].tf = MockTensorFrame(feat_dict, col_names_dict)
+                meta_data[t_name].num_nodes = 0
+                
+        return meta_data
+
+    def prune_schema(self, question: str, db_id: str, top_k_tables=4) -> Tuple[List[int], List[int]]:
+        """Question-Aware Schema Pruning (2-hop)"""
         if db_id not in self.schemas:
             return [], []
             
@@ -254,23 +333,14 @@ class BirdSQLAdapter:
         G = self.graphs[db_id]
         cached_embs = self.schema_embeddings[db_id]
         
-        # 1. 编码问题（使用缓存）
-        q_emb = self._encode_text([question], use_cache=True)[0] # [Dim]
-        
-        # 2. 锚点识别 (Anchor Identification)
-        # 计算问题与表名的相似度
+        q_emb = self._encode_text([question], use_cache=True)[0]
         t_sim = torch.nn.functional.cosine_similarity(q_emb.unsqueeze(0), cached_embs['table_embs'])
         
-        # 选出 Top-K 表作为 Anchors
-        # 也可以加入 Column 相似度来辅助，这里先只用 Table 简化
         num_tables = len(schema['table_names'])
         k = min(top_k_tables, num_tables)
         anchor_table_indices = torch.topk(t_sim, k).indices.tolist()
         
-        # 3. 结构扩展 (2-hop Expansion)
         active_tables = set(anchor_table_indices)
-        
-        # 1-hop
         neighbors = set()
         for t_idx in anchor_table_indices:
             if t_idx in G:
@@ -278,7 +348,6 @@ class BirdSQLAdapter:
                     neighbors.add(nbr)
         active_tables.update(neighbors)
         
-        # 2-hop (Optional: 如果表太少，再扩一圈)
         if len(active_tables) < 5:
             second_hop = set()
             for t_idx in neighbors:
@@ -288,10 +357,6 @@ class BirdSQLAdapter:
             active_tables.update(second_hop)
             
         active_table_indices = sorted(list(active_tables))
-        
-        # 4. 确定 Active Columns
-        # 默认规则：如果表被选中，则保留该表的所有列
-        # (进阶规则：只保留 High Similarity Columns + Primary Keys + Foreign Keys)
         active_col_indices = []
         for col_idx, (tbl_idx, _) in enumerate(schema['column_names']):
             if tbl_idx in active_table_indices:
@@ -300,23 +365,11 @@ class BirdSQLAdapter:
         return active_table_indices, active_col_indices
     
     def prune_schema_batch(self, questions: List[str], db_ids: List[str], top_k_tables=4) -> List[Tuple[List[int], List[int]]]:
-        """
-        批量 Schema Pruning（优化：共享问题编码）
-        
-        Args:
-            questions: 问题列表
-            db_ids: 数据库ID列表（与questions长度相同）
-            top_k_tables: Top-K 表数量
-            
-        Returns:
-            List[Tuple[List[int], List[int]]]: 每个问题的 (active_table_indices, active_col_indices)
-        """
+        """批量 Schema Pruning"""
         if len(questions) != len(db_ids):
             raise ValueError("questions and db_ids must have the same length")
         
         results = []
-        
-        # 批量编码所有问题（利用批处理效率）
         unique_questions = list(set(questions))
         question_to_emb = {}
         if unique_questions:
@@ -324,26 +377,20 @@ class BirdSQLAdapter:
             for q, emb in zip(unique_questions, batch_embs):
                 question_to_emb[q] = emb
         
-        # 为每个问题执行 Pruning
         for question, db_id in zip(questions, db_ids):
             if db_id not in self.schemas:
                 results.append(([], []))
                 continue
-                
             schema = self.schemas[db_id]
             G = self.graphs[db_id]
             cached_embs = self.schema_embeddings[db_id]
-            
-            # 使用预编码的问题嵌入
             q_emb = question_to_emb[question]
             
-            # 锚点识别
             t_sim = torch.nn.functional.cosine_similarity(q_emb.unsqueeze(0), cached_embs['table_embs'])
             num_tables = len(schema['table_names'])
             k = min(top_k_tables, num_tables)
             anchor_table_indices = torch.topk(t_sim, k).indices.tolist()
             
-            # 结构扩展
             active_tables = set(anchor_table_indices)
             neighbors = set()
             for t_idx in anchor_table_indices:
@@ -361,51 +408,18 @@ class BirdSQLAdapter:
                 active_tables.update(second_hop)
             
             active_table_indices = sorted(list(active_tables))
-            active_col_indices = [
-                col_idx for col_idx, (tbl_idx, _) in enumerate(schema['column_names'])
-                if tbl_idx in active_table_indices
-            ]
-            
+            active_col_indices = [col_idx for col_idx, (tbl_idx, _) in enumerate(schema['column_names']) if tbl_idx in active_table_indices]
             results.append((active_table_indices, active_col_indices))
-        
         return results
 
     def get_sample_hetero_data(self, question: str, db_id: str):
-        """
-        构建 model_clean.py 所需的 HeteroData 对象
-        包含 DeepSeek 初始化的特征
-        
-        Args:
-            question: 自然语言问题
-            db_id: 数据库ID
-            
-        Returns:
-            HeteroData: 图数据对象
-        """
-        # 1. Pruning
+        """构建单个 HeteroData 对象"""
         active_table_idxs, active_col_idxs = self.prune_schema(question, db_id)
-        
-        # 2. 使用内部方法构建 HeteroData
         return self._build_hetero_data_single(db_id, active_table_idxs, active_col_idxs)
     
     def get_sample_hetero_data_batch(self, questions: List[str], db_ids: List[str]) -> List[HeteroData]:
-        """
-        批量构建 HeteroData 对象（优化版本）
-        
-        Args:
-            questions: 问题列表
-            db_ids: 数据库ID列表（与questions长度相同）
-            
-        Returns:
-            List[HeteroData]: 每个问题对应的 HeteroData 对象
-        """
-        if len(questions) != len(db_ids):
-            raise ValueError("questions and db_ids must have the same length")
-        
-        # 批量执行 Pruning（共享问题编码）
+        """批量构建 HeteroData 对象"""
         pruning_results = self.prune_schema_batch(questions, db_ids)
-        
-        # 为每个问题构建 HeteroData
         results = []
         for question, db_id, (active_table_idxs, active_col_idxs) in zip(questions, db_ids, pruning_results):
             try:
@@ -413,19 +427,15 @@ class BirdSQLAdapter:
                 results.append(data)
             except Exception as e:
                 print(f"⚠️ Warning: Failed to build HeteroData for question '{question[:50]}...' in {db_id}: {e}")
-                results.append(HeteroData())  # 返回空的 HeteroData
-        
+                results.append(HeteroData()) 
         return results
     
     def _build_hetero_data_single(self, db_id: str, active_table_idxs: List[int], active_col_idxs: List[int]) -> HeteroData:
-        """
-        为单个问题构建 HeteroData（内部方法，从 get_sample_hetero_data 中提取）
-        """
+        """为单个问题构建 HeteroData (内部方法)"""
         schema = self.schemas[db_id]
         data = HeteroData()
         col_names = schema['column_names']
         
-        # 构建节点特征
         for t_idx in active_table_idxs:
             table_name = schema['table_names'][t_idx]
             curr_table_col_idxs = [i for i in active_col_idxs if col_names[i][0] == t_idx]
@@ -433,7 +443,6 @@ class BirdSQLAdapter:
             if not curr_table_col_idxs:
                 continue
             
-            # 使用连接池读取数据
             db_path = os.path.join(self.train_db_root, db_id, f"{db_id}.sqlite")
             conn = self.db_pool.get_connection(db_path)
             cursor = conn.cursor()
@@ -441,17 +450,14 @@ class BirdSQLAdapter:
             try:
                 cursor.execute(f"SELECT * FROM `{table_name}` LIMIT 3")
                 rows = cursor.fetchall()
-                cols = [description[0] for description in cursor.description]
             except Exception as e:
-                print(f"⚠️ Warning: Failed to read from table {table_name} in {db_id}: {e}")
+                # print(f"⚠️ Warning: Failed to read from table {table_name}: {e}")
                 rows = []
-                cols = []
             finally:
                 self.db_pool.return_connection(db_path, conn)
             
             num_rows = max(len(rows), 1)
             
-            # 收集列的 Embedding
             table_col_embs = []
             for c_idx in curr_table_col_idxs:
                 emb = self.schema_embeddings[db_id]['col_embs'][c_idx]
@@ -463,19 +469,13 @@ class BirdSQLAdapter:
             col_feats = torch.stack(table_col_embs)
             col_feats = col_feats.unsqueeze(0).expand(num_rows, -1, -1)
             
-            feat_dict = {
-                stype.text_embedded: col_feats.float()
-            }
-            
+            feat_dict = {stype.text_embedded: col_feats.float()}
             c_names = [col_names[i][1] for i in curr_table_col_idxs]
-            col_names_dict = {
-                stype.text_embedded: c_names
-            }
+            col_names_dict = {stype.text_embedded: c_names}
             
             data[table_name].tf = MockTensorFrame(feat_dict, col_names_dict)
             data[table_name].num_nodes = num_rows
         
-        # 构建边
         for src_col, dst_col in schema['foreign_keys']:
             src_t_idx = col_names[src_col][0]
             dst_t_idx = col_names[dst_col][0]
@@ -492,38 +492,17 @@ class BirdSQLAdapter:
         return data
     
     def __del__(self):
-        """清理资源：关闭数据库连接池"""
+        """清理资源"""
         if hasattr(self, 'db_pool'):
             self.db_pool.close_all()
 
 # --- 测试代码 ---
 if __name__ == "__main__":
-    # 请根据实际路径修改
     BIRD_ROOT = "/data/cuishuai/datasets/text-to-sql/BIRD-SQL" 
-    # 使用一个小模型做测试，实际运行时换成 DeepSeek
     TEST_MODEL = "sentence-transformers/all-MiniLM-L6-v2" 
-    
     if os.path.exists(BIRD_ROOT):
         adapter = BirdSQLAdapter(BIRD_ROOT, TEST_MODEL)
-        
-        # 测试 Pruning
-        q = "How many customers are from New York?"
-        # 假设取第一个数据库
+        q = "How many customers?"
         db_id = list(adapter.schemas.keys())[0]
-        
-        print(f"\n🔍 Testing Pruning on DB: {db_id}")
         t_idxs, c_idxs = adapter.prune_schema(q, db_id)
-        print(f"   Selected Tables: {[adapter.schemas[db_id]['table_names'][i] for i in t_idxs]}")
-        
-        # 测试 HeteroData 构建
-        print(f"\n📦 Building HeteroData...")
-        data = adapter.get_sample_hetero_data(q, db_id)
-        print(f"   Node Types: {data.node_types}")
-        print(f"   Edge Types: {data.edge_types}")
-        
-        # 检查特征维度
-        for nt in data.node_types:
-            if hasattr(data[nt], 'tf'):
-                print(f"   Table {nt}: {data[nt].tf.feat_dict[stype.text_embedded].shape}")
-    else:
-        print(f"❌ Path not found: {BIRD_ROOT}")
+        print(f"Selected Tables: {t_idxs}")
